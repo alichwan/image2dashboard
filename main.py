@@ -8,6 +8,7 @@ and derives the resulting combined "main color".
 
 import argparse
 import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -67,12 +68,33 @@ def label(img: np.ndarray, text: str) -> np.ndarray:
     return img
 
 
-def build_grid(frame: np.ndarray, c: float, m: float, y: float) -> np.ndarray:
+def draw_timeseries(frame: np.ndarray, x: int, y: int, w: int, h: int,
+                     histories: list[deque], colors: list[tuple[int, int, int]],
+                     y_max: float = 100.0) -> np.ndarray:
+    """Draw overlaid line charts (one per history, 0..y_max on the y-axis) in a rect."""
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (30, 30, 30), -1)
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (90, 90, 90), 1)
+    for hist, color in zip(histories, colors):
+        n = len(hist)
+        if n < 2:
+            continue
+        points = []
+        for i, value in enumerate(hist):
+            px = x + int(i * (w - 1) / (n - 1))
+            frac = min(max(value / y_max, 0.0), 1.0)
+            py = y + h - 1 - int(frac * (h - 1))
+            points.append((px, py))
+        for p0, p1 in zip(points, points[1:]):
+            cv2.line(frame, p0, p1, color, 1, cv2.LINE_AA)
+    return frame
+
+
+def build_grid(frame: np.ndarray, c_hist: deque, m_hist: deque, y_hist: deque) -> np.ndarray:
     """Arrange the original frame plus isolated C/M/Y ink channels into a 2x2 grid."""
     h, w = frame.shape[:2]
     half_w, half_h = w // 2, h // 2
 
-    original = draw_dashboard(frame.copy(), c, m, y)
+    original = draw_dashboard(frame.copy(), c_hist, m_hist, y_hist)
     cyan_only = emphasize_ink(frame, "c")
     magenta_only = emphasize_ink(frame, "m")
     yellow_only = emphasize_ink(frame, "y")
@@ -88,23 +110,29 @@ def build_grid(frame: np.ndarray, c: float, m: float, y: float) -> np.ndarray:
     return np.vstack([top, bottom])
 
 
-def draw_dashboard(frame: np.ndarray, c: float, m: float, y: float) -> np.ndarray:
-    """Overlay CMY (%) bars and the combined main-color swatch onto the frame."""
-    panel_w = 220
+def draw_dashboard(frame: np.ndarray, c_hist: deque, m_hist: deque, y_hist: deque) -> np.ndarray:
+    """Overlay a CMY (%) timeseries chart and the combined main-color swatch onto the frame."""
+    c = c_hist[-1] if c_hist else 0.0
+    m = m_hist[-1] if m_hist else 0.0
+    y = y_hist[-1] if y_hist else 0.0
+
+    panel_w = 620
+    panel_h = 210
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (panel_w, 165), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (0, 0), (panel_w, panel_h), (0, 0, 0), -1)
     frame = cv2.addWeighted(overlay, 0.6, frame, 0.4, 0)
 
-    bar_max = panel_w - 90
     channels = [("C", c, (255, 255, 0)), ("M", m, (255, 0, 255)), ("Y", y, (0, 255, 255))]
     for i, (chan_label, value, color) in enumerate(channels):
-        y_pos = 25 + i * 30
-        cv2.putText(frame, f"{chan_label} {value:5.1f}%", (5, y_pos + 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-        bar_len = int(bar_max * (value / 100))
-        cv2.rectangle(frame, (75, y_pos - 8), (75 + bar_len, y_pos + 2), color, -1)
+        x_pos = 5 + i * 70
+        cv2.putText(frame, f"{chan_label} {value:4.0f}%", (x_pos, 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
 
-    swatch_y = 25 + 3 * 30 + 10
+    draw_timeseries(frame, 5, 25, panel_w - 10, 90,
+                     [c_hist, m_hist, y_hist],
+                     [(255, 255, 0), (255, 0, 255), (0, 255, 255)])
+
+    swatch_y = 125
     cv2.putText(frame, "Main color", (5, swatch_y - 5),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
     cv2.rectangle(frame, (5, swatch_y), (panel_w - 10, swatch_y + 30),
@@ -113,13 +141,15 @@ def draw_dashboard(frame: np.ndarray, c: float, m: float, y: float) -> np.ndarra
 
 
 def run(camera_index: int = 0, interval: float = 1.0,
-        denoise: str = "gaussian", denoise_strength: int = 5) -> None:
+        denoise: str = "gaussian", denoise_strength: int = 5, history: int = 60) -> None:
     """Show the live camera feed, refreshing color stats every `interval` seconds."""
     cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
         raise RuntimeError(f"Could not open camera {camera_index}")
 
-    c = m = y = 0.0
+    c_hist: deque = deque(maxlen=history)
+    m_hist: deque = deque(maxlen=history)
+    y_hist: deque = deque(maxlen=history)
     last_analysis = 0.0
 
     try:
@@ -133,10 +163,13 @@ def run(camera_index: int = 0, interval: float = 1.0,
             now = time.time()
             if now - last_analysis >= interval:
                 c, m, y = analyze_colors(frame)
+                c_hist.append(c)
+                m_hist.append(m)
+                y_hist.append(y)
                 last_analysis = now
                 print(f"C={c:.1f}% M={m:.1f}% Y={y:.1f}% -> main color BGR{cmy_to_bgr(c, m, y)}")
 
-            grid = build_grid(frame, c, m, y)
+            grid = build_grid(frame, c_hist, m_hist, y_hist)
             cv2.imshow("image2dashboard", grid)
 
             if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -155,10 +188,12 @@ def parse_args() -> argparse.Namespace:
                          default="gaussian", help="Noise-reduction filter applied per frame (default: gaussian)")
     parser.add_argument("--denoise-strength", type=int, default=5,
                          help="Kernel size / filter diameter for the denoise filter (default: 5)")
+    parser.add_argument("--history", type=int, default=60,
+                         help="Number of past samples to keep in the CMY timeseries chart (default: 60)")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
     run(camera_index=args.camera, interval=args.interval,
-        denoise=args.denoise, denoise_strength=args.denoise_strength)
+        denoise=args.denoise, denoise_strength=args.denoise_strength, history=args.history)
